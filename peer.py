@@ -11,18 +11,26 @@ LISTEN_HOST = "0.0.0.0"
 
 # Put every peer IP here on every machine.
 # Example:
-# PEERS = ["10.97.0.2:5000", "10.97.0.3:5000"]
+# PEERS = ["10.97.0.2", "10.97.0.3"]
 PEERS = [
-    "10.75.151.146:5000",
+    "10.75.151.146",
+    "10.75.151.248",
 ]
 
 peers = {}
 lock = threading.Lock()
 
 
+def normalize_peer(value: str) -> str:
+    if value.count(":") == 1:
+        host, _ = value.rsplit(":", 1)
+        return host
+    return value
+
+
 def add_peer(address: str, sock: socket.socket):
     with lock:
-        peers[address] = sock
+        peers[normalize_peer(address)] = sock
 
 
 def remove_peer(sock):
@@ -34,19 +42,19 @@ def remove_peer(sock):
 
 
 def connect_to_peer(address: str):
-    host, port = address.rsplit(":", 1)
-    port = int(port)
+    target = normalize_peer(address)
+
     with lock:
-        if address in peers:
+        if target in peers:
             return
 
     try:
-        sock = socket.create_connection((host, port), timeout=1)
+        sock = socket.create_connection((target, PORT), timeout=1)
         sock.setblocking(False)
-        add_peer(address, sock)
-        print(f"Connected to {address}")
+        add_peer(target, sock)
+        print(f"Connected to {target}")
     except OSError:
-        print(f"Could not connect to {address}")
+        print(f"Could not connect to {target}")
 
 
 def broadcast(message: str):
@@ -94,7 +102,13 @@ def listen_loop():
 
         while True:
             conn, addr = listener.accept()
-            remote = f"{addr[0]}:{addr[1]}"
+            remote = normalize_peer(addr[0])
+
+            with lock:
+                if remote in peers:
+                    conn.close()
+                    continue
+
             conn.setblocking(False)
             add_peer(remote, conn)
             threading.Thread(target=handle_connection, args=(conn, remote), daemon=True).start()
@@ -104,10 +118,11 @@ def listen_loop():
 def reconnect_loop():
     while True:
         for peer in PEERS:
+            target = normalize_peer(peer)
             with lock:
-                connected = peer in peers
+                connected = target in peers
             if not connected:
-                connect_to_peer(peer)
+                connect_to_peer(target)
         time.sleep(2)
 
 
