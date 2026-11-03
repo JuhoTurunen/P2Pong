@@ -1,4 +1,11 @@
-import select
+"""Edit PEERS on each laptop, then run: python3 peer.py
+
+All laptops run the same code. Each opens a sending connection to the others
+and accepts their sending connections. Two one-way connections per pair keep
+this proof of concept simple: no server, handshake, or duplicate negotiation.
+"""
+
+import codecs
 import socket
 import sys
 import termios
@@ -7,161 +14,124 @@ import time
 import tty
 
 PORT = 5000
-LISTEN_HOST = "0.0.0.0"
+# Set these to the OTHER two laptops' Wi-Fi IP addresses on each laptop.
+PEERS = ["10.75.151.146", "10.75.151.248"]
 
-# Put every peer IP here on every machine.
-# Example:
-# PEERS = ["10.97.0.2", "10.97.0.3"]
-PEERS = [
-    "10.75.151.146",
-    "10.75.151.248",
-]
-
-peers = {}
+outgoing = {}
 lock = threading.Lock()
 
 
-def normalize_peer(value: str) -> str:
-    if value.count(":") == 1:
-        host, _ = value.rsplit(":", 1)
-        return host
-    return value
-
-
-def add_peer(address: str, sock: socket.socket):
-    with lock:
-        peers[normalize_peer(address)] = sock
-
-
-def remove_peer(sock):
-    with lock:
-        for address, existing in list(peers.items()):
-            if existing is sock:
-                del peers[address]
-                break
-
-
-def connect_to_peer(address: str):
-    target = normalize_peer(address)
-
-    with lock:
-        if target in peers:
-            return
-
+def close_connection(sock):
     try:
-        sock = socket.create_connection((target, PORT), timeout=1)
-        sock.setblocking(False)
-        add_peer(target, sock)
-        print(f"Connected to {target}")
+        sock.shutdown(socket.SHUT_RDWR)
     except OSError:
-        print(f"Could not connect to {target}")
+        pass
+    sock.close()
 
 
-def broadcast(message: str):
-    payload = message.encode()
-    with lock:
-        targets = list(peers.values())
-
-    for sock in targets:
-        try:
-            sock.sendall(payload)
-        except OSError:
-            try:
-                sock.close()
-            except OSError:
-                pass
-            remove_peer(sock)
-
-
-def handle_connection(conn: socket.socket, remote: str):
+def receive(sock, host):
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
         while True:
-            data = conn.recv(4096)
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                continue
             if not data:
                 break
-            text = data.decode(errors="replace")
-            print(f"\n[{remote}] {text}", end="", flush=True)
-    except BlockingIOError:
-        pass
+            # TCP is a byte stream; the decoder also handles split UTF-8 keys.
+            for key in decoder.decode(data):
+                print(f"[{host}] {key!r}", flush=True)
     except OSError:
         pass
     finally:
-        try:
-            conn.close()
-        except OSError:
-            pass
-        remove_peer(conn)
+        close_connection(sock)
 
 
-def listen_loop():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((LISTEN_HOST, PORT))
-        listener.listen(10)
-        print(f"Listening on {LISTEN_HOST}:{PORT}")
-
-        while True:
-            conn, addr = listener.accept()
-            remote = normalize_peer(addr[0])
-
-            with lock:
-                if remote in peers:
-                    conn.close()
-                    continue
-
-            conn.setblocking(False)
-            add_peer(remote, conn)
-            threading.Thread(target=handle_connection, args=(conn, remote), daemon=True).start()
-            print(f"Accepted connection from {remote}")
-
-
-def reconnect_loop():
+def listen(listener):
     while True:
-        for peer in PEERS:
-            target = normalize_peer(peer)
+        try:
+            sock, address = listener.accept()
+        except OSError:
+            return
+        threading.Thread(target=receive, args=(sock, address[0]), daemon=True).start()
+
+
+def connect(host):
+    waiting = False
+    while True:
+        try:
+            sock = socket.create_connection((host, PORT), timeout=1)
+        except OSError:
+            if not waiting:
+                print(f"Waiting for {host}:{PORT}", flush=True)
+                waiting = True
+        else:
+            waiting = False
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(0.5)
             with lock:
-                connected = target in peers
-            if not connected:
-                connect_to_peer(target)
-        time.sleep(2)
+                outgoing[host] = sock
+            print(f"Connected to {host}", flush=True)
+            # The other end only receives on this socket. Waiting here detects
+            # its disconnect, so we can reconnect even when nobody types.
+            receive(sock, host)
+            with lock:
+                if outgoing.get(host) is sock:
+                    del outgoing[host]
+            print(f"Disconnected from {host}; reconnecting", flush=True)
+        time.sleep(1)
 
 
-def keyboard_input_loop():
+def broadcast(key):
+    with lock:
+        targets = list(outgoing.values())
+    sent = 0
+    for sock in targets:
+        try:
+            sock.sendall(key.encode("utf-8"))
+            sent += 1
+        except OSError:
+            close_connection(sock)
+    return sent
+
+
+def keyboard():
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
-
     try:
-        tty.setraw(fd)
+        tty.setcbreak(fd)  # Immediate keys without Enter; Ctrl+C still works.
         while True:
-            ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if not ready:
-                continue
-
             key = sys.stdin.read(1)
-            if key == "\x03":
+            if not key:
                 break
-
-            if key == "\r":
-                key = "\n"
-
-            print(key, end="", flush=True)
-            broadcast(key)
+            sent = broadcast(key)
+            print(f"[you] {key!r} -> {sent} peer(s)", flush=True)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def main():
-    listener_thread = threading.Thread(target=listen_loop, daemon=True)
-    listener_thread.start()
-
-    reconnect_thread = threading.Thread(target=reconnect_loop, daemon=True)
-    reconnect_thread.start()
-
-    for peer in PEERS:
-        connect_to_peer(peer)
-
-    keyboard_input_loop()
+    if not sys.stdin.isatty():
+        print("Run python3 peer.py in a terminal.", file=sys.stderr)
+        return 1
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("0.0.0.0", PORT))
+            listener.listen()
+            print(f"Listening on port {PORT}. Ctrl+C quits.", flush=True)
+            threading.Thread(target=listen, args=(listener,), daemon=True).start()
+            for host in set(PEERS):
+                threading.Thread(target=connect, args=(host,), daemon=True).start()
+            keyboard()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except OSError as exc:
+        print(f"Cannot run peer: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
